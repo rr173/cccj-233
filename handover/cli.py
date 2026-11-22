@@ -7,9 +7,15 @@
                   [--crash-after-commit-seq K]
   handover status --db R.db [--dump]
 
+  handover ledger-build   --db L.db --snapshot O.jsonl --order ORDER.json
+                          --receiver R.db --times TIMES.json --scans SCANS.jsonl
+  handover ledger-correct --db L.db --correction C.json [--crash-before-commit]
+  handover ledger-status  --db L.db [--scans]
+
 Exit codes: 0 ok; 2 usage/IO error; 3 invalid source material; 4 valid
 source but no legal migration exists (a wait-cycle report is printed);
-5 a submission was rejected by the receiver.
+5 a submission was rejected by the receiver / a ledger request was
+rejected; 12 the ledger-correct crash hook fired (test hook only).
 """
 from __future__ import annotations
 
@@ -19,6 +25,8 @@ import os
 import sys
 
 from . import core
+from . import ledger
+from .ledger import Ledger, LedgerReject
 from .receiver import Receiver, Reject
 
 
@@ -150,6 +158,62 @@ def cmd_status(a):
     return 0
 
 
+def cmd_ledger_build(a):
+    try:
+        snapshot = core.validate_table(_read_lines(a.snapshot), "snapshot")
+        order = core.load_order(a.order)
+        with open(a.times, encoding="utf-8") as f:
+            times_obj = json.load(f)
+        times = ledger.validate_step_times(times_obj, order)
+        scans = ledger.validate_scans(_read_lines(a.scans))
+    except core.SourceInvalid as e:
+        _print({"result": "invalid_source", "problems": e.problems})
+        return 3
+    except LedgerReject as e:
+        _print({"result": "rejected", "code": e.code, "detail": e.detail})
+        return 5
+    except (OSError, json.JSONDecodeError) as e:
+        _print({"result": "invalid_source", "problems": [str(e)]})
+        return 3
+    try:
+        res = Ledger.build(a.db, snapshot, order, a.receiver, times, scans)
+    except LedgerReject as e:
+        _print({"result": "rejected", "code": e.code, "detail": e.detail})
+        return 5
+    _print({"result": "built", **res})
+    return 0
+
+
+def cmd_ledger_correct(a):
+    try:
+        with open(a.correction, encoding="utf-8") as f:
+            doc = ledger.validate_correction(json.load(f))
+    except core.SourceInvalid as e:
+        _print({"result": "invalid_source", "problems": e.problems})
+        return 3
+    except (OSError, json.JSONDecodeError) as e:
+        _print({"result": "invalid_source", "problems": [str(e)]})
+        return 3
+    try:
+        lg = Ledger(a.db)
+        res = lg.correct(doc, crash_before_commit=a.crash_before_commit)
+    except LedgerReject as e:
+        _print({"result": "rejected", "code": e.code, "detail": e.detail})
+        return 5
+    _print(res)
+    return 0
+
+
+def cmd_ledger_status(a):
+    try:
+        lg = Ledger(a.db, write=False)
+    except LedgerReject as e:
+        _print({"result": "rejected", "code": e.code, "detail": e.detail})
+        return 5
+    _print(lg.status(with_scans=a.scans))
+    return 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="handover",
@@ -191,6 +255,37 @@ def build_parser():
     sp.add_argument("--db", required=True)
     sp.add_argument("--dump", action="store_true", help="also dump all rows")
     sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser(
+        "ledger-build",
+        help="build a scan-attribution ledger from a completed handover")
+    sp.add_argument("--db", required=True, help="ledger path (must not exist)")
+    sp.add_argument("--snapshot", required=True,
+                    help="original binding snapshot (JSONL)")
+    sp.add_argument("--order", required=True, help="work order (JSON)")
+    sp.add_argument("--receiver", required=True,
+                    help="completed receiver db (opened read-only)")
+    sp.add_argument("--times", required=True,
+                    help="step effective times (handover-step-times/1 JSON)")
+    sp.add_argument("--scans", required=True, help="scan records (JSONL)")
+    sp.set_defaults(func=cmd_ledger_build)
+
+    sp = sub.add_parser("ledger-correct",
+                        help="apply a group of step-time corrections in place")
+    sp.add_argument("--db", required=True)
+    sp.add_argument("--correction", required=True,
+                    help="handover-time-correction/1 JSON")
+    sp.add_argument("--crash-before-commit", action="store_true",
+                    help="test hook: die after the correction's writes, "
+                         "before COMMIT (exit code 12)")
+    sp.set_defaults(func=cmd_ledger_correct)
+
+    sp = sub.add_parser("ledger-status",
+                        help="show step times, counts and applied corrections")
+    sp.add_argument("--db", required=True)
+    sp.add_argument("--scans", action="store_true",
+                    help="also dump every scan's attribution")
+    sp.set_defaults(func=cmd_ledger_status)
     return p
 
 
