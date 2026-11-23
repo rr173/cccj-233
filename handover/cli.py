@@ -12,10 +12,14 @@
   handover ledger-correct --db L.db --correction C.json [--crash-before-commit]
   handover ledger-status  --db L.db [--scans]
 
+  handover verify       --ledger L.db --routes R.jsonl --assoc A.jsonl --out V.db
+  handover verify-check --result V.db --ledger L.db
+
 Exit codes: 0 ok; 2 usage/IO error; 3 invalid source material; 4 valid
 source but no legal migration exists (a wait-cycle report is printed);
 5 a submission was rejected by the receiver / a ledger request was
-rejected; 12 the ledger-correct crash hook fired (test hook only).
+rejected / a verification request was rejected or a result failed its
+re-check; 12 the ledger-correct crash hook fired (test hook only).
 """
 from __future__ import annotations
 
@@ -26,13 +30,22 @@ import sys
 
 from . import core
 from . import ledger
+from . import verify
 from .ledger import Ledger, LedgerReject
 from .receiver import Receiver, Reject
+from .verify import VerifyReject
 
 
 def _read_lines(path):
     with open(path, encoding="utf-8") as f:
         return f.read().splitlines()
+
+
+def _iter_lines(path):
+    """Stream the lines of a JSONL file (never the whole file in memory)."""
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            yield line
 
 
 def _print(obj):
@@ -214,6 +227,39 @@ def cmd_ledger_status(a):
     return 0
 
 
+def cmd_verify(a):
+    try:
+        res = verify.verify(a.ledger, _iter_lines(a.routes),
+                            _iter_lines(a.assoc), a.out)
+    except core.SourceInvalid as e:
+        _print({"result": "invalid_source", "problems": e.problems})
+        return 3
+    except VerifyReject as e:
+        _print({"result": "rejected", "code": e.code, "detail": e.detail})
+        return 5
+    except OSError as e:
+        _print({"result": "invalid_source", "problems": [str(e)]})
+        return 3
+    _print(res)
+    return 0
+
+
+def cmd_verify_check(a):
+    try:
+        ok, problems = verify.verify_result(a.result, a.ledger)
+    except VerifyReject as e:
+        _print({"result": "rejected", "code": e.code, "detail": e.detail})
+        return 5
+    except OSError as e:
+        _print({"result": "rejected", "code": "io_error", "detail": str(e)})
+        return 5
+    if ok:
+        _print({"result": "consistent"})
+        return 0
+    _print({"result": "inconsistent", "problems": problems})
+    return 5
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="handover",
@@ -286,6 +332,26 @@ def build_parser():
     sp.add_argument("--scans", action="store_true",
                     help="also dump every scan's attribution")
     sp.set_defaults(func=cmd_ledger_status)
+
+    sp = sub.add_parser(
+        "verify",
+        help="offline per-package missing-scan verification against the ledger")
+    sp.add_argument("--ledger", required=True,
+                    help="scan-attribution ledger db (opened read-only)")
+    sp.add_argument("--routes", required=True, help="package routes (JSONL)")
+    sp.add_argument("--assoc", required=True,
+                    help="package/scan associations (JSONL)")
+    sp.add_argument("--out", required=True,
+                    help="verification result db path (must not exist)")
+    sp.set_defaults(func=cmd_verify)
+
+    sp = sub.add_parser(
+        "verify-check",
+        help="re-check a verification result against the current ledger")
+    sp.add_argument("--result", required=True, help="verification result db")
+    sp.add_argument("--ledger", required=True,
+                    help="scan-attribution ledger db (opened read-only)")
+    sp.set_defaults(func=cmd_verify_check)
     return p
 
 

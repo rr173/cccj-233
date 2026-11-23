@@ -10,6 +10,7 @@ from .core import (
 )
 from .receiver import Receiver, Reject
 from .ledger import Ledger, LedgerReject
+from .verify import VerifyReject, verify_result
 
 __all__ = [
     "ABSENT", "OFFLINE", "ONLINE", "FORMAT",
@@ -21,4 +22,5 @@ __all__ = [
     "replay_check",
     "Receiver", "Reject",
     "Ledger", "LedgerReject",
+    "VerifyReject", "verify_result",
 ]
