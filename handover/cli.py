@@ -15,23 +15,32 @@
   handover verify       --ledger L.db --routes R.jsonl --assoc A.jsonl --out V.db
   handover verify-check --result V.db --ledger L.db
 
+  handover manifest        --ledger L.db --pack-ch CH-A --gate-ch CH-B
+                           --log LOG.jsonl --out M.db
+  handover manifest-status --db M.db [--scan GATE_SCAN]
+
 Exit codes: 0 ok; 2 usage/IO error; 3 invalid source material; 4 valid
 source but no legal migration exists (a wait-cycle report is printed);
 5 a submission was rejected by the receiver / a ledger request was
-rejected / a verification request was rejected or a result failed its
-re-check; 12 the ledger-correct crash hook fired (test hook only).
+rejected / a verification or manifest request was rejected or a result
+failed its re-check; 12 the ledger-correct crash hook fired (test hook
+only).
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import sqlite3
 import sys
+import urllib.parse
 
 from . import core
 from . import ledger
+from . import manifest as manifest_mod
 from . import verify
 from .ledger import Ledger, LedgerReject
+from .manifest import ManifestReject
 from .receiver import Receiver, Reject
 from .verify import VerifyReject
 
@@ -260,6 +269,75 @@ def cmd_verify_check(a):
     return 5
 
 
+def cmd_manifest(a):
+    try:
+        res = manifest_mod.build_manifest(a.ledger, a.pack_ch, a.gate_ch,
+                                          _iter_lines(a.log), a.out)
+    except core.SourceInvalid as e:
+        _print({"result": "invalid_source", "problems": e.problems})
+        return 3
+    except ManifestReject as e:
+        _print({"result": "rejected", "code": e.code, "detail": e.detail})
+        return 5
+    except OSError as e:
+        _print({"result": "invalid_source", "problems": [str(e)]})
+        return 3
+    _print(res)
+    return 0
+
+
+def cmd_manifest_status(a):
+    try:
+        con = sqlite3.connect(
+            f"file:{urllib.parse.quote(a.db)}?mode=ro", uri=True)
+    except sqlite3.Error as e:
+        _print({"result": "rejected", "code": "manifest_unreadable",
+                "detail": str(e)})
+        return 5
+    try:
+        try:
+            meta = dict(con.execute("SELECT k, v FROM meta"))
+        except sqlite3.Error as e:
+            _print({"result": "rejected", "code": "not_a_manifest",
+                    "detail": str(e)})
+            return 5
+        if meta.get("format") != manifest_mod.MANIFEST_FORMAT:
+            _print({"result": "rejected", "code": "not_a_manifest",
+                    "detail": f"{a.db} is not a "
+                              f"{manifest_mod.MANIFEST_FORMAT} database"})
+            return 5
+        out = {"format": meta["format"], "meta": meta,
+               "groups": [
+                   {"ord": o, "scan": s, "ts": t, "use": u,
+                    "adopted": bool(ad),
+                    "reasons": json.loads(r) if r is not None else []}
+                   for o, s, t, u, ad, r in con.execute(
+                       "SELECT ord, scan_id, ts, use, adopted, reason "
+                       "FROM groups ORDER BY ord")]}
+        if a.scan is not None:
+            row = con.execute(
+                "SELECT gate_id, scan_id, ts, root_id FROM manifests "
+                "WHERE scan_id = ?", (a.scan,)).fetchone()
+            if row is None:
+                out["shipment"] = None
+            else:
+                gid, sid, ts, root = row
+                objs = [
+                    {"kind": k, "id": i, "parent": p, "via": v}
+                    for k, i, p, v in con.execute(
+                        "SELECT kind, id, parent, via FROM manifest "
+                        "WHERE gate_id = ? ORDER BY kind, id", (gid,))]
+                out["shipment"] = {
+                    "scan_id": sid, "ts": ts, "root": root,
+                    "packages": [o["id"] for o in objs
+                                 if o["kind"] == manifest_mod.KIND_PKG],
+                    "objects": objs}
+        _print(out)
+        return 0
+    finally:
+        con.close()
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="handover",
@@ -352,6 +430,29 @@ def build_parser():
     sp.add_argument("--ledger", required=True,
                     help="scan-attribution ledger db (opened read-only)")
     sp.set_defaults(func=cmd_verify_check)
+
+    sp = sub.add_parser(
+        "manifest",
+        help="rebuild a shipment manifest offline from the ledger and a "
+             "packing log")
+    sp.add_argument("--ledger", required=True,
+                    help="scan-attribution ledger db (opened read-only)")
+    sp.add_argument("--pack-ch", required=True,
+                    help="channel number registered for packing scans")
+    sp.add_argument("--gate-ch", required=True,
+                    help="channel number registered for gate scans")
+    sp.add_argument("--log", required=True, help="packing log (JSONL)")
+    sp.add_argument("--out", required=True,
+                    help="manifest result db path (must not exist)")
+    sp.set_defaults(func=cmd_manifest)
+
+    sp = sub.add_parser(
+        "manifest-status",
+        help="read a manifest back: groups, adoption and one shipment")
+    sp.add_argument("--db", required=True, help="manifest result db")
+    sp.add_argument("--scan", default=None,
+                    help="also print the shipment of this gate scan id")
+    sp.set_defaults(func=cmd_manifest_status)
     return p
 
 
